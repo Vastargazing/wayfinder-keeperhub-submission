@@ -1,0 +1,292 @@
+diff --git a/wayfinder_paths/adapters/aave_v3_adapter/adapter.py b/wayfinder_paths/adapters/aave_v3_adapter/adapter.py
+index 3167667..1c9f5a9 100644
+--- a/wayfinder_paths/adapters/aave_v3_adapter/adapter.py
++++ b/wayfinder_paths/adapters/aave_v3_adapter/adapter.py
+@@ -14,7 +14,10 @@ from wayfinder_paths.core.constants.aave_v3_abi import (
+     WETH_ABI,
+     WRAPPED_TOKEN_GATEWAY_V3_ABI,
+ )
+-from wayfinder_paths.core.constants.aave_v3_contracts import AAVE_V3_BY_CHAIN
++from wayfinder_paths.core.constants.aave_v3_contracts import (
++    AAVE_V3_BY_CHAIN,
++    AAVE_V3_TESTNET_CHAIN_IDS,
++)
+ from wayfinder_paths.core.constants.base import MAX_UINT256, SECONDS_PER_YEAR
+ from wayfinder_paths.core.constants.contracts import ZERO_ADDRESS
+ from wayfinder_paths.core.utils import web3 as web3_utils
+@@ -429,14 +432,27 @@ class AaveV3Adapter(BaseAdapter):
+         account: str,
+         include_zero_positions: bool = False,
+         include_rewards: bool = True,
++        include_testnets: bool = False,
+     ) -> tuple[bool, dict[str, Any] | str]:
+-        """Query all supported Aave V3 chains and merge results."""
++        """Query all supported Aave V3 chains and merge results.
++
++        Test networks in the address book are skipped unless
++        ``include_testnets`` is set: a portfolio read is about real holdings, and
++        a testnet chain would otherwise contribute both an extra RPC round trip
++        and fake balances to every caller. Per-chain reads
++        (``get_full_user_state_per_chain``) are unaffected — ask for the chain id
++        and you get it.
++        """
+         account = to_checksum_address(account)
+         all_positions: list[dict[str, Any]] = []
+         chains_queried: list[dict[str, Any]] = []
+         errors: list[str] = []
++        skipped_testnets: list[int] = []
+ 
+         for cid in AAVE_V3_BY_CHAIN:
++            if not include_testnets and cid in AAVE_V3_TESTNET_CHAIN_IDS:
++                skipped_testnets.append(cid)
++                continue
+             ok, result = await self.get_full_user_state_per_chain(
+                 chain_id=cid,
+                 account=account,
+@@ -465,6 +481,7 @@ class AaveV3Adapter(BaseAdapter):
+             "chains": chains_queried,
+             "positions": all_positions,
+             "errors": errors,
++            "skipped_testnet_chain_ids": skipped_testnets,
+         }
+ 
+     async def get_full_user_state_per_chain(
+diff --git a/wayfinder_paths/adapters/aave_v3_adapter/test_adapter.py b/wayfinder_paths/adapters/aave_v3_adapter/test_adapter.py
+index dbc61f7..7611980 100644
+--- a/wayfinder_paths/adapters/aave_v3_adapter/test_adapter.py
++++ b/wayfinder_paths/adapters/aave_v3_adapter/test_adapter.py
+@@ -2,9 +2,14 @@ from contextlib import asynccontextmanager
+ from unittest.mock import AsyncMock, MagicMock, patch
+ 
+ import pytest
++from eth_utils import to_checksum_address
+ 
+ from wayfinder_paths.adapters.aave_v3_adapter.adapter import AaveV3Adapter
+ from wayfinder_paths.core.constants.aave_v3_abi import UI_POOL_RESERVE_KEYS
++from wayfinder_paths.core.constants.aave_v3_contracts import (
++    AAVE_V3_BY_CHAIN,
++    AAVE_V3_TESTNET_CHAIN_IDS,
++)
+ from wayfinder_paths.core.constants.contracts import ZERO_ADDRESS
+ 
+ FAKE_ADDR = "0x1234567890123456789012345678901234567890"
+@@ -542,3 +547,173 @@ class TestAaveV3Adapter:
+         assert ok is True
+         assert result["wrap_tx"] == "0xabc"
+         assert result["repay_tx"] == "0xabc"
++
++    # ---- Base Sepolia (84532) ----
++    #
++    # These are written to fail on the unmodified address book. Each one names
++    # the Base Sepolia address literally rather than reading it back out of
++    # AAVE_V3_BY_CHAIN, so a wrong address in the book is a test failure and not
++    # a tautology, and so is the copy-paste failure the shape of this change
++    # invites: reusing Base mainnet's pool for Base Sepolia.
++
++    BASE_SEPOLIA = 84532
++    BASE_SEPOLIA_POOL = "0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27"
++    BASE_MAINNET_POOL = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
++    BASE_SEPOLIA_USDC = "0xba50Cd2A20f6DA35D788639E581bca8d0B5d4D5f"
++
++    def test_entry_base_sepolia_is_supported(self, adapter):
++        entry = adapter._entry(self.BASE_SEPOLIA)
++        assert entry["pool"] == self.BASE_SEPOLIA_POOL
++        # Not Base mainnet's pool, and not any other chain's.
++        assert entry["pool"] != self.BASE_MAINNET_POOL
++        others = {
++            cid: e["pool"]
++            for cid, e in AAVE_V3_BY_CHAIN.items()
++            if cid != self.BASE_SEPOLIA
++        }
++        assert self.BASE_SEPOLIA_POOL not in others.values()
++
++    def test_entry_unknown_chain_is_still_rejected(self, adapter):
++        # Adding a chain must not turn _entry into a permissive lookup.
++        with pytest.raises(ValueError, match=r"Unsupported Aave v3 chain_id=1234567"):
++            adapter._entry(1234567)
++
++    def test_base_sepolia_entry_has_the_same_keys_as_base_mainnet(self):
++        assert set(AAVE_V3_BY_CHAIN[self.BASE_SEPOLIA]) == set(AAVE_V3_BY_CHAIN[8453])
++
++    def test_base_sepolia_addresses_are_checksummed_and_distinct(self):
++        entry = AAVE_V3_BY_CHAIN[self.BASE_SEPOLIA]
++        for key, value in entry.items():
++            assert value == to_checksum_address(value), key
++        # Seven distinct roles, seven distinct contracts: a duplicated value
++        # would mean a key was filled in from the wrong source.
++        assert len(set(entry.values())) == len(entry)
++
++    def test_base_sepolia_is_marked_as_a_testnet(self):
++        assert self.BASE_SEPOLIA in AAVE_V3_TESTNET_CHAIN_IDS
++        for cid in AAVE_V3_TESTNET_CHAIN_IDS:
++            assert cid in AAVE_V3_BY_CHAIN, cid
++        # Mainnets stay mainnets.
++        assert AAVE_V3_TESTNET_CHAIN_IDS.isdisjoint({1, 8453, 42161, 137, 56, 43114})
++
++    @pytest.mark.asyncio
++    @patch(
++        "wayfinder_paths.adapters.aave_v3_adapter.adapter.send_transaction",
++        new_callable=AsyncMock,
++        return_value="0xfeed",
++    )
++    @patch(
++        "wayfinder_paths.adapters.aave_v3_adapter.adapter.ensure_allowance",
++        new_callable=AsyncMock,
++        return_value=(True, "ok"),
++    )
++    @patch(
++        "wayfinder_paths.adapters.aave_v3_adapter.adapter.encode_call",
++        new_callable=AsyncMock,
++        return_value={"to": FAKE_ADDR},
++    )
++    async def test_lend_erc20_on_base_sepolia_targets_the_base_sepolia_pool(
++        self, mock_encode, mock_allowance, mock_send, adapter
++    ):
++        ok, result = await adapter.lend(
++            chain_id=self.BASE_SEPOLIA,
++            underlying_token=self.BASE_SEPOLIA_USDC,
++            qty=1_000_000,
++        )
++        assert ok is True
++        assert result == "0xfeed"
++
++        # The approval must name the Base Sepolia pool as spender, on 84532.
++        allow_kwargs = mock_allowance.await_args.kwargs
++        assert allow_kwargs["spender"] == self.BASE_SEPOLIA_POOL
++        assert allow_kwargs["token_address"] == self.BASE_SEPOLIA_USDC
++        assert allow_kwargs["chain_id"] == self.BASE_SEPOLIA
++        assert allow_kwargs["amount"] == 1_000_000
++
++        # The supply must be encoded against the Base Sepolia pool, on 84532.
++        enc_kwargs = mock_encode.await_args.kwargs
++        assert enc_kwargs["target"] == self.BASE_SEPOLIA_POOL
++        assert enc_kwargs["target"] != self.BASE_MAINNET_POOL
++        assert enc_kwargs["chain_id"] == self.BASE_SEPOLIA
++        assert enc_kwargs["fn_name"] == "supply"
++        assert enc_kwargs["args"] == [
++            self.BASE_SEPOLIA_USDC,
++            1_000_000,
++            FAKE_ADDR,
++            0,
++        ]
++        # onBehalfOf is the strategy wallet, not the pool or the asset.
++        assert enc_kwargs["args"][2] == adapter.wallet_address
++        assert enc_kwargs["from_address"] == FAKE_ADDR
++        mock_send.assert_awaited_once()
++
++    @pytest.mark.asyncio
++    @patch(
++        "wayfinder_paths.adapters.aave_v3_adapter.adapter.send_transaction",
++        new_callable=AsyncMock,
++        return_value="0xbeef",
++    )
++    @patch(
++        "wayfinder_paths.adapters.aave_v3_adapter.adapter.encode_call",
++        new_callable=AsyncMock,
++        return_value={"to": FAKE_ADDR},
++    )
++    async def test_unlend_erc20_on_base_sepolia_targets_the_base_sepolia_pool(
++        self, mock_encode, mock_send, adapter
++    ):
++        ok, result = await adapter.unlend(
++            chain_id=self.BASE_SEPOLIA,
++            underlying_token=self.BASE_SEPOLIA_USDC,
++            qty=400_000,
++        )
++        assert ok is True
++        assert result == "0xbeef"
++
++        enc_kwargs = mock_encode.await_args.kwargs
++        assert enc_kwargs["target"] == self.BASE_SEPOLIA_POOL
++        assert enc_kwargs["target"] != self.BASE_MAINNET_POOL
++        assert enc_kwargs["chain_id"] == self.BASE_SEPOLIA
++        assert enc_kwargs["fn_name"] == "withdraw"
++        assert enc_kwargs["args"] == [self.BASE_SEPOLIA_USDC, 400_000, FAKE_ADDR]
++        mock_send.assert_awaited_once()
++
++    @pytest.mark.asyncio
++    async def test_lend_still_refuses_a_chain_with_no_entry(self, adapter):
++        ok, message = await adapter.lend(
++            chain_id=1234567, underlying_token=FAKE_ASSET, qty=1
++        )
++        assert ok is False
++        assert "Unsupported Aave v3 chain_id=1234567" in message
++
++    @pytest.mark.asyncio
++    async def test_get_full_user_state_skips_testnets_by_default(self, adapter):
++        seen: list[int] = []
++
++        async def fake_per_chain(*, chain_id, **_kwargs):
++            seen.append(chain_id)
++            return True, {"positions": [], "pool": "0x", "userEmodeCategoryId": 0}
++
++        adapter.get_full_user_state_per_chain = fake_per_chain
++        ok, result = await adapter.get_full_user_state(account=FAKE_ADDR)
++
++        assert ok is True
++        assert self.BASE_SEPOLIA not in seen
++        assert 8453 in seen  # mainnets are untouched
++        assert result["skipped_testnet_chain_ids"] == [self.BASE_SEPOLIA]
++
++    @pytest.mark.asyncio
++    async def test_get_full_user_state_includes_testnets_when_asked(self, adapter):
++        seen: list[int] = []
++
++        async def fake_per_chain(*, chain_id, **_kwargs):
++            seen.append(chain_id)
++            return True, {"positions": [], "pool": "0x", "userEmodeCategoryId": 0}
++
++        adapter.get_full_user_state_per_chain = fake_per_chain
++        ok, result = await adapter.get_full_user_state(
++            account=FAKE_ADDR, include_testnets=True
++        )
++
++        assert ok is True
++        assert self.BASE_SEPOLIA in seen
++        assert result["skipped_testnet_chain_ids"] == []
+diff --git a/wayfinder_paths/core/constants/aave_v3_contracts.py b/wayfinder_paths/core/constants/aave_v3_contracts.py
+index fc8c9bb..077d447 100644
+--- a/wayfinder_paths/core/constants/aave_v3_contracts.py
++++ b/wayfinder_paths/core/constants/aave_v3_contracts.py
+@@ -148,4 +148,41 @@ AAVE_V3_BY_CHAIN: dict[int, dict[str, str]] = {
+         ),
+         "oracle": to_checksum_address("0x33E0b3fc976DC9C516926BA48CfC0A9E10a2aAA5"),
+     },
++    # Base Sepolia (TESTNET). Market id on chain: "Aave V3 Base Testnet Market".
++    # Every address below was read back from the chain rather than copied from a
++    # document: `pool` round-trips through Pool.ADDRESSES_PROVIDER() ->
++    # PoolAddressesProvider.getPool(); `oracle` is getPriceOracle();
++    # `rewards_controller` agrees between getAddress(keccak("INCENTIVES_CONTROLLER"))
++    # and aToken.getIncentivesController(); the two UI data providers answer
++    # getReservesData / getReservesIncentivesData for this provider with the same
++    # six reserves the pool lists; `wrapped_token_gateway`.getWETHAddress() returns
++    # 0x4200...0006, which is one of those reserves.
++    # NOTE: this is a testnet. It is listed in AAVE_V3_TESTNET_CHAIN_IDS below and is
++    # therefore skipped by the cross-chain portfolio walk unless asked for explicitly.
++    84532: {
++        "pool": to_checksum_address("0x8bAB6d1b75f19e9eD9fCe8b9BD338844fF79aE27"),
++        "pool_addresses_provider": to_checksum_address(
++            "0xE4C23309117Aa30342BFaae6c95c6478e0A4Ad00"
++        ),
++        "ui_pool_data_provider": to_checksum_address(
++            "0x3cB7B00B6C09B71998124196691e8bF2694De863"
++        ),
++        "ui_incentive_data_provider": to_checksum_address(
++            "0xDB1412acf288D5bE057f8e90fd7b1BF4f84bB3B1"
++        ),
++        "rewards_controller": to_checksum_address(
++            "0x71B448405c803A3982aBa448133133D2DEAFBE5F"
++        ),
++        "wrapped_token_gateway": to_checksum_address(
++            "0x0568130e794429D2eEBC4dafE18f25Ff1a1ed8b6"
++        ),
++        "oracle": to_checksum_address("0x943b0dE18d4abf4eF02A85912F8fc07684C141dF"),
++    },
+ }
++
++# Chain ids in AAVE_V3_BY_CHAIN that are test networks. Kept as an explicit set
++# rather than inferred, because "is this a testnet?" is not derivable from an
++# address. `AaveV3Adapter.get_full_user_state` walks the address book to build a
++# cross-chain portfolio; without this set, adding a testnet would silently add a
++# testnet RPC round trip (and testnet balances) to every mainnet portfolio read.
++AAVE_V3_TESTNET_CHAIN_IDS: frozenset[int] = frozenset({84532})

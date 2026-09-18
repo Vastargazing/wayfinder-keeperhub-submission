@@ -1,0 +1,19 @@
+[project]
+name = "keeperhub-wayfinder-executor"
+version = "0.1.0"
+description = "A TransactionExecutor for the Wayfinder Paths SDK seam, backed by self-hosted KeeperHub"
+requires-python = ">=3.12"
+dependencies = [
+    "wayfinder-paths==0.11.1",
+    "httpx>=0.27",
+    "eth-abi>=5.0",
+    "eth-utils>=4.0",
+    "loguru>=0.7",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["keeperhub_executor"]

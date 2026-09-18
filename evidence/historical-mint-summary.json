@@ -1,0 +1,37 @@
+{
+  "started_at": "2026-09-09T11:05:50.970909+00:00",
+  "finished_at": "2026-09-09T11:05:59.137710+00:00",
+  "live": true,
+  "transport": "live",
+  "outcome": "consumed",
+  "returned_hash": "0x27a8a3847017b5dac5e91c41f1854e73cf92abff5bbc000e574f50b0e4108c63",
+  "kind": "redacted derived summary, not raw receipt",
+  "mode": "HISTORICAL hosted Base Sepolia",
+  "historical_project_head": "f90fc61b5a573502ebefdaee796e7e5cd883d6e9",
+  "counts": {
+    "begin": 0,
+    "submit": 0,
+    "consume_success": 1,
+    "sdk_base_send": 1
+  },
+  "source_sha256": "0f66424a86c0d363745362a862b5b5b79528ae07d4ee61a57e3169585e10a53d",
+  "acceptance_sha256": "5270eca92d2b35af27d4f1cd34eb38b7784f24bac44ace0324db14dcc2de900d",
+  "before": {
+    "chain_id": 84532,
+    "state": "submitted",
+    "consumed": 0,
+    "txn_hash": "0x27a8a3847017b5dac5e91c41f1854e73cf92abff5bbc000e574f50b0e4108c63",
+    "updated_at": 1788940735.76,
+    "operation_count": 2
+  },
+  "after": {
+    "chain_id": 84532,
+    "state": "submitted",
+    "consumed": 1,
+    "txn_hash": "0x27a8a3847017b5dac5e91c41f1854e73cf92abff5bbc000e574f50b0e4108c63",
+    "updated_at": 1788951958.871,
+    "operation_count": 2
+  },
+  "goalVerified": false,
+  "boundary": "Historical result consumption on then-accepted code. No new Aave cycle or current-code live crash proof. Raw receipt and full private runtime records are not distributed."
+}

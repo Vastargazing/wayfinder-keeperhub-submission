@@ -1,0 +1,863 @@
+diff --git a/wayfinder_paths/core/utils/executor.py b/wayfinder_paths/core/utils/executor.py
+new file mode 100644
+index 0000000..8b659fc
+--- /dev/null
++++ b/wayfinder_paths/core/utils/executor.py
+@@ -0,0 +1,465 @@
++"""External transaction executor seam.
++
++An :class:`ExternalExecution` binds a caller-provided :class:`TransactionExecutor`
++(a service that owns the key and broadcasts on the SDK's behalf) to an
++:class:`OperationJournal` (a local, durable record of every submission). It is
++consulted by :func:`wayfinder_paths.core.utils.transaction.send_transaction`
++*before* the sponsored path and before local signing.
++
++Contract, in order:
++
++1. The SDK builds the unsigned envelope ``{chainId, from, to, data, value}``.
++2. The SDK allocates an operation id and persists ``(operation id, envelope)``
++   to the journal **before** the executor is called. The id is the idempotency
++   key: an executor that has already seen it must not sign a second time.
++3. The executor submits and returns a transaction hash. The SDK records the
++   hash and waits for the receipt itself.
++4. If the executor's answer is lost (exception, timeout, process crash) the
++   SDK raises :class:`ExecutionOutcomeUnknownError` and leaves the journal
++   entry ``pending``. It never falls back to sponsored or local signing — that
++   would open a second send path for the same operation.
++5. On the next send from the same process or a restarted one, every
++   ``pending`` entry is resolved first by asking ``executor.lookup(op_id)``,
++   which answers with a three-valued :class:`LookupResult`:
++
++   - ``landed(hash)``  — the hash is stored ``unconsumed``; the next send of an
++     identical envelope from the same sender claims it instead of resending.
++   - ``never_seen()``  — nothing was signed for this id, so the caller may
++     safely send again. This is a *strong claim* (see :class:`LookupResult`).
++   - ``indeterminate()`` — the executor knows about the id but cannot say
++     whether it reached the chain. Treated exactly like a lookup exception:
++     :class:`ExecutionOutcomeUnknownError`, row stays ``pending``, no new send.
++
++   A two-valued ``hash | None`` lookup cannot express the third case, and
++   collapsing it into "never seen" is a double-send bug: an executor that
++   broadcast and died before recording the hash would be re-sent.
++
++Nonce, gas limit and fee fields are deliberately absent from the envelope: the
++executor owns nonce allocation for its address, so
++:func:`~wayfinder_paths.core.utils.transaction.nonce_transaction` (which reads
++``pending`` transaction counts from the RPC pool) must not run on this path.
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import sqlite3
++import uuid
++from dataclasses import dataclass
++from enum import Enum
++from pathlib import Path
++from typing import Any, Protocol, runtime_checkable
++
++from loguru import logger
++from web3 import AsyncWeb3
++
++ENVELOPE_KEYS = ("chainId", "from", "to", "data", "value")
++
++
++class ExecutionOutcomeUnknownError(RuntimeError):
++    """The executor was invoked but its answer for ``operation_id`` was lost.
++
++    The operation may or may not have reached the chain. Callers must not
++    retry through another send path; resolve it via ``executor.lookup`` (which
++    :meth:`ExternalExecution.resolve_pending` does on the next send).
++    """
++
++    def __init__(self, operation_id: str, message: str | None = None):
++        self.operation_id = operation_id
++        super().__init__(message or f"Outcome of operation {operation_id} is unknown")
++
++
++class LookupOutcome(Enum):
++    """The three things an executor can honestly say about an operation id."""
++
++    LANDED = "landed"
++    NEVER_SEEN = "never_seen"
++    INDETERMINATE = "indeterminate"
++
++
++@dataclass(frozen=True)
++class LookupResult:
++    """Answer to "what happened to operation X?".
++
++    Three-valued on purpose. A bare ``str | None`` conflates two worlds that
++    demand opposite actions:
++
++    - ``never_seen`` — the executor never received, never signed and never
++      broadcast this id. Proceeding is safe. **This is a strong claim**: the
++      executor may only make it if it durably persists the operation id
++      *before* it does anything that could reach the chain, so that "no
++      record" really does imply "no broadcast". An executor that records the
++      id only after broadcasting must never return ``never_seen``.
++    - ``indeterminate`` — the executor has (or may have) touched this id but
++      cannot prove the outcome: it crashed between broadcast and record, its
++      store is unreachable, the id is in an in-flight state. Proceeding would
++      risk a **double send**, so the SDK treats this exactly like a lookup
++      exception: :class:`ExecutionOutcomeUnknownError`, journal row left
++      ``pending``, nothing new sent, retried on the next attempt.
++
++    A production executor resolves ``indeterminate`` by **reconciling against
++    the chain**, not by guessing: look for a transaction it signed for that
++    operation (its own nonce range / sender / a recorded raw signed payload),
++    verify the receipt, and only then answer ``landed`` or ``never_seen``.
++    KeeperHub already has the two pieces this needs — receipt verification and
++    sign-once/failover reconciliation — which is why the seam pushes the
++    question there instead of resolving it with a heuristic here.
++    """
++
++    outcome: LookupOutcome
++    txn_hash: str | None = None
++    detail: str | None = None
++
++    def __post_init__(self) -> None:
++        if self.outcome is LookupOutcome.LANDED:
++            if not self.txn_hash:
++                raise ValueError("LookupResult.landed requires a transaction hash")
++        elif self.txn_hash:
++            raise ValueError(f"{self.outcome.value} result must not carry a hash")
++
++    @classmethod
++    def landed(cls, txn_hash: str, detail: str | None = None) -> LookupResult:
++        """The executor produced this transaction for that operation id."""
++        return cls(LookupOutcome.LANDED, _normalize_hash(txn_hash), detail)
++
++    @classmethod
++    def never_seen(cls, detail: str | None = None) -> LookupResult:
++        """Nothing was ever signed or broadcast for that id (strong claim)."""
++        return cls(LookupOutcome.NEVER_SEEN, None, detail)
++
++    @classmethod
++    def indeterminate(cls, detail: str | None = None) -> LookupResult:
++        """The executor cannot say whether that id reached the chain."""
++        return cls(LookupOutcome.INDETERMINATE, None, detail)
++
++
++@runtime_checkable
++class TransactionExecutor(Protocol):
++    """A service that signs and broadcasts envelopes for one EVM address.
++
++    ``wallet_address`` is the only address this executor can send from; every
++    envelope's ``from`` must equal it. Implementations must persist
++    ``operation_id`` before signing, because :meth:`lookup` is expected to be
++    authoritative: ``never_seen`` must mean "never signed", never "not indexed
++    yet" — the latter is ``indeterminate``.
++    """
++
++    wallet_address: str
++
++    async def submit(self, envelope: dict[str, Any], *, operation_id: str) -> str:
++        """Sign and broadcast ``envelope``; return the ``0x`` transaction hash."""
++        ...
++
++    async def lookup(self, operation_id: str) -> LookupResult:
++        """Say what became of ``operation_id``: landed / never seen / unknown.
++
++        Returning anything other than a :class:`LookupResult` (a bare hash, or
++        ``None``) is a contract violation and is handled like a failed
++        lookup — no new send — because it cannot distinguish "never signed"
++        from "signed, outcome unrecorded".
++        """
++        ...
++
++
++def build_envelope(transaction: dict[str, Any]) -> dict[str, Any]:
++    """Reduce a transaction dict to the unsigned executor envelope.
++
++    Gas, fee and nonce fields are dropped: they are the executor's to decide.
++    """
++    if "chainId" not in transaction or "from" not in transaction:
++        raise ValueError("Transaction must contain chainId and from")
++    to = transaction.get("to")
++    data = transaction.get("data") or "0x"
++    if isinstance(data, (bytes, bytearray)):
++        data = "0x" + bytes(data).hex()
++    return {
++        "chainId": int(transaction["chainId"]),
++        "from": AsyncWeb3.to_checksum_address(transaction["from"]),
++        "to": AsyncWeb3.to_checksum_address(to) if to else None,
++        "data": data,
++        "value": int(transaction.get("value") or 0),
++    }
++
++
++def envelope_digest(envelope: dict[str, Any]) -> str:
++    """Stable content hash of an envelope, used to match a resumed send."""
++    canonical = json.dumps(
++        {k: envelope.get(k) for k in ENVELOPE_KEYS},
++        sort_keys=True,
++        separators=(",", ":"),
++    )
++    return hashlib.sha256(canonical.encode()).hexdigest()
++
++
++class OperationJournal:
++    """SQLite-backed record of every envelope handed to an executor.
++
++    States:
++
++    - ``pending``: executor invoked, hash not yet recorded (crash window).
++      Also where an operation stays while its outcome is ``indeterminate`` —
++      the row is deliberately not mutated, so every later send re-asks.
++    - ``submitted``: executor returned (or lookup found) a hash.
++    - ``never_seen``: the executor asserted it never signed this id, so
++      nothing reached the chain and the caller may send again. Terminal.
++    - ``orphaned``: landed after a crash but the caller moved on to a newer
++      operation without claiming it. Needs human/driver reconciliation.
++
++    There is no ``indeterminate`` state: an undetermined outcome is not a
++    resting place. It stays ``pending`` and blocks new sends for that sender
++    until the executor can answer ``landed`` or ``never_seen``.
++
++    ``consumed`` marks whether the hash was returned to the SDK caller. A
++    ``submitted`` + unconsumed row is a landed send whose caller crashed
++    before learning the hash. :meth:`claim` hands it to the next send only if
++    that send is the identical envelope *and* nothing newer was begun since —
++    i.e. the caller resumed at the step that was in flight. Anything else is a
++    driver that re-ran earlier steps, and guessing there would double-execute.
++    """
++
++    def __init__(self, path: str | Path):
++        self.path = Path(path)
++        self.path.parent.mkdir(parents=True, exist_ok=True)
++        self._conn = sqlite3.connect(self.path, isolation_level=None)
++        self._conn.execute("PRAGMA journal_mode=WAL")
++        self._conn.execute(
++            """
++            CREATE TABLE IF NOT EXISTS operations (
++                operation_id TEXT PRIMARY KEY,
++                sender       TEXT NOT NULL,
++                chain_id     INTEGER NOT NULL,
++                digest       TEXT NOT NULL,
++                envelope     TEXT NOT NULL,
++                state        TEXT NOT NULL,
++                txn_hash     TEXT,
++                consumed     INTEGER NOT NULL DEFAULT 0,
++                created_at   REAL NOT NULL DEFAULT (unixepoch('subsec')),
++                updated_at   REAL NOT NULL DEFAULT (unixepoch('subsec'))
++            )
++            """
++        )
++
++    def close(self) -> None:
++        self._conn.close()
++
++    def begin(self, envelope: dict[str, Any]) -> str:
++        """Persist a new ``pending`` operation and return its id.
++
++        This commits before returning; the executor must only be called after.
++        Any landed-but-unclaimed operation for the same sender becomes
++        ``orphaned``: it is no longer the latest, so it can never be claimed.
++        """
++        operation_id = uuid.uuid4().hex
++        self._conn.execute(
++            "UPDATE operations SET state='orphaned', updated_at=unixepoch('subsec')"
++            " WHERE state='submitted' AND consumed=0 AND sender=? AND chain_id=?",
++            (envelope["from"].lower(), int(envelope["chainId"])),
++        )
++        self._conn.execute(
++            "INSERT INTO operations (operation_id, sender, chain_id, digest, envelope, state)"
++            " VALUES (?, ?, ?, ?, ?, 'pending')",
++            (
++                operation_id,
++                envelope["from"].lower(),
++                int(envelope["chainId"]),
++                envelope_digest(envelope),
++                json.dumps(envelope, sort_keys=True),
++            ),
++        )
++        return operation_id
++
++    def record_hash(self, operation_id: str, txn_hash: str, *, consumed: bool) -> None:
++        self._conn.execute(
++            "UPDATE operations SET state='submitted', txn_hash=?, consumed=?,"
++            " updated_at=unixepoch('subsec') WHERE operation_id=?",
++            (txn_hash, int(consumed), operation_id),
++        )
++
++    def mark_never_seen(self, operation_id: str) -> None:
++        """Record the executor's assertion that this id was never signed."""
++        self._conn.execute(
++            "UPDATE operations SET state='never_seen', updated_at=unixepoch('subsec')"
++            " WHERE operation_id=?",
++            (operation_id,),
++        )
++
++    def pending(self, sender: str, chain_id: int) -> list[dict[str, Any]]:
++        rows = self._conn.execute(
++            "SELECT operation_id, envelope FROM operations"
++            " WHERE state='pending' AND sender=? AND chain_id=? ORDER BY created_at",
++            (sender.lower(), int(chain_id)),
++        ).fetchall()
++        return [{"operation_id": r[0], "envelope": json.loads(r[1])} for r in rows]
++
++    def claim(self, envelope: dict[str, Any]) -> tuple[str, str] | None:
++        """Consume the latest operation if it landed unclaimed and matches ``envelope``.
++
++        Returns ``(operation_id, txn_hash)`` or None. Only operations resolved
++        after a crash are ever unconsumed, and only the most recent one is
++        eligible, so a legitimate repeat of an identical envelope is never
++        swallowed in normal operation.
++        """
++        row = self._conn.execute(
++            "SELECT operation_id, txn_hash, state, consumed, digest FROM operations"
++            " WHERE sender=? AND chain_id=? ORDER BY created_at DESC LIMIT 1",
++            (envelope["from"].lower(), int(envelope["chainId"])),
++        ).fetchone()
++        if (
++            row is None
++            or row[2] != "submitted"
++            or row[3]
++            or row[4] != envelope_digest(envelope)
++        ):
++            return None
++        self._conn.execute(
++            "UPDATE operations SET consumed=1, updated_at=unixepoch('subsec')"
++            " WHERE operation_id=?",
++            (row[0],),
++        )
++        return row[0], row[1]
++
++    def entries(self) -> list[dict[str, Any]]:
++        """All rows, oldest first (diagnostics / tests)."""
++        rows = self._conn.execute(
++            "SELECT operation_id, sender, chain_id, digest, envelope, state, txn_hash,"
++            " consumed, created_at, updated_at FROM operations ORDER BY created_at"
++        ).fetchall()
++        keys = (
++            "operation_id",
++            "sender",
++            "chain_id",
++            "digest",
++            "envelope",
++            "state",
++            "txn_hash",
++            "consumed",
++            "created_at",
++            "updated_at",
++        )
++        out = []
++        for r in rows:
++            d = dict(zip(keys, r, strict=True))
++            d["envelope"] = json.loads(d["envelope"])
++            d["consumed"] = bool(d["consumed"])
++            out.append(d)
++        return out
++
++
++class ExternalExecution:
++    """Binds a :class:`TransactionExecutor` to an :class:`OperationJournal`.
++
++    Attach it to a sign callback as ``sign_callback.external_execution`` (see
++    :func:`wayfinder_paths.core.utils.wallets.get_external_executor_callback`)
++    and ``send_transaction`` routes every envelope through :meth:`send`.
++    """
++
++    def __init__(self, executor: TransactionExecutor, journal: OperationJournal):
++        self.executor = executor
++        self.journal = journal
++        self.wallet_address = AsyncWeb3.to_checksum_address(executor.wallet_address)
++
++    async def resolve_pending(self, chain_id: int) -> list[dict[str, Any]]:
++        """Ask the executor about every ``pending`` operation for our address.
++
++        Landed hashes are recorded unconsumed so an identical re-send can claim
++        them; ids the executor asserts it never signed become ``never_seen``.
++        An ``indeterminate`` answer — and a lookup that raises, or returns
++        something that is not a :class:`LookupResult` — raises
++        :class:`ExecutionOutcomeUnknownError`: nothing new may be sent while an
++        earlier outcome is undetermined, and the row stays ``pending`` so the
++        next attempt asks again.
++        """
++        resolved = []
++        for entry in self.journal.pending(self.wallet_address, chain_id):
++            op_id = entry["operation_id"]
++            try:
++                result = _require_lookup_result(await self.executor.lookup(op_id))
++            except Exception as exc:  # noqa: BLE001
++                raise ExecutionOutcomeUnknownError(
++                    op_id, f"lookup for pending operation {op_id} failed: {exc}"
++                ) from exc
++
++            if result.outcome is LookupOutcome.INDETERMINATE:
++                logger.error(
++                    f"Executor cannot determine the outcome of operation {op_id}"
++                    f" ({result.detail or 'no detail'}); it stays pending"
++                )
++                raise ExecutionOutcomeUnknownError(
++                    op_id,
++                    f"executor reported an indeterminate outcome for operation "
++                    f"{op_id}: {result.detail or 'no detail'}. It may already be "
++                    f"on chain; reconcile against the chain before sending again.",
++                )
++            if result.outcome is LookupOutcome.LANDED:
++                assert result.txn_hash is not None  # guaranteed by LookupResult
++                self.journal.record_hash(op_id, result.txn_hash, consumed=False)
++                logger.info(f"Pending operation {op_id} landed as {result.txn_hash}")
++            else:
++                self.journal.mark_never_seen(op_id)
++                logger.warning(
++                    f"Executor asserts it never signed operation {op_id}"
++                    f" ({result.detail or 'no detail'}); safe to send again"
++                )
++            resolved.append(
++                {
++                    **entry,
++                    "outcome": result.outcome.value,
++                    "txn_hash": result.txn_hash,
++                }
++            )
++        return resolved
++
++    async def send(self, transaction: dict[str, Any]) -> str:
++        """Submit ``transaction`` through the executor and return its hash."""
++        envelope = build_envelope(transaction)
++        if envelope["from"] != self.wallet_address:
++            raise ValueError(
++                f"Envelope from={envelope['from']} does not match executor "
++                f"address {self.wallet_address}"
++            )
++        chain_id = envelope["chainId"]
++
++        await self.resolve_pending(chain_id)
++
++        claimed = self.journal.claim(envelope)
++        if claimed is not None:
++            op_id, txn_hash = claimed
++            logger.info(
++                f"Reusing landed operation {op_id} ({txn_hash}) instead of resending"
++            )
++            return txn_hash
++
++        op_id = self.journal.begin(envelope)  # durable before the executor sees it
++        logger.info(f"Submitting operation {op_id} to external executor: {envelope}")
++        try:
++            txn_hash = await self.executor.submit(envelope, operation_id=op_id)
++        except Exception as exc:  # noqa: BLE001
++            # Leave the row pending: the executor may have signed. No fallback.
++            raise ExecutionOutcomeUnknownError(
++                op_id, f"executor did not answer for operation {op_id}: {exc}"
++            ) from exc
++        if not txn_hash:
++            raise ExecutionOutcomeUnknownError(
++                op_id, f"executor returned no hash for operation {op_id}"
++            )
++        txn_hash = _normalize_hash(txn_hash)
++        self.journal.record_hash(op_id, txn_hash, consumed=True)
++        return txn_hash
++
++
++def _require_lookup_result(value: object) -> LookupResult:
++    """Reject a two-valued lookup loudly instead of guessing what it meant."""
++    if isinstance(value, LookupResult):
++        return value
++    raise TypeError(
++        "TransactionExecutor.lookup must return a LookupResult "
++        f"(landed / never_seen / indeterminate); got {value!r}. A bare hash or "
++        "None cannot distinguish 'never signed' from 'signed, outcome "
++        "unrecorded', and treating the latter as the former double-sends."
++    )
++
++
++def _normalize_hash(txn_hash: str) -> str:
++    h = txn_hash if isinstance(txn_hash, str) else "0x" + bytes(txn_hash).hex()
++    return h if h.startswith("0x") else f"0x{h}"
+diff --git a/wayfinder_paths/core/utils/test_executor.py b/wayfinder_paths/core/utils/test_executor.py
+new file mode 100644
+index 0000000..2841586
+--- /dev/null
++++ b/wayfinder_paths/core/utils/test_executor.py
+@@ -0,0 +1,300 @@
++from unittest.mock import patch
++
++import pytest
++
++from wayfinder_paths.core.utils.executor import (
++    ExecutionOutcomeUnknownError,
++    ExternalExecution,
++    LookupOutcome,
++    LookupResult,
++    OperationJournal,
++    build_envelope,
++)
++from wayfinder_paths.core.utils.transaction import send_transaction
++from wayfinder_paths.core.utils.wallets import get_external_executor_callback
++
++SENDER = "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed"
++TARGET = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"
++TX = {"chainId": 8453, "from": SENDER, "to": TARGET, "data": "0x1234", "value": 0}
++
++
++class RecordingExecutor:
++    """Minimal TransactionExecutor with the same durability model as a real one.
++
++    An operation id is persisted as ``signing`` *before* the broadcast and
++    updated to ``broadcast`` with the hash after, so ``lookup`` can answer all
++    three values: no record -> ``never_seen``, ``signing`` -> ``indeterminate``
++    (it may or may not have reached the chain), hash -> ``landed``.
++    """
++
++    def __init__(self, journal: OperationJournal | None = None):
++        self.wallet_address = SENDER
++        self.journal = journal
++        self.records: dict[str, dict] = {}
++        self.submits = 0
++        self.lose_response = False
++        #: False models a crash between broadcast and recording the hash.
++        self.record_hash_after_broadcast = True
++        self.pending_at_submit: list[str] = []
++
++    async def submit(self, envelope, *, operation_id):
++        self.submits += 1
++        if self.journal is not None:
++            self.pending_at_submit = [
++                e["operation_id"]
++                for e in self.journal.pending(envelope["from"], envelope["chainId"])
++            ]
++        self.records[operation_id] = {"status": "signing"}  # persisted BEFORE broadcast
++        txn_hash = f"0x{self.submits:064x}"
++        if self.record_hash_after_broadcast:
++            self.records[operation_id] = {"status": "broadcast", "hash": txn_hash}
++        if self.lose_response:
++            raise TimeoutError("response lost")
++        return txn_hash
++
++    async def lookup(self, operation_id):
++        record = self.records.get(operation_id)
++        if record is None:
++            return LookupResult.never_seen(
++                "no record; ids are persisted before signing"
++            )
++        if record.get("hash"):
++            return LookupResult.landed(record["hash"])
++        return LookupResult.indeterminate(
++            f"operation is {record['status']}; broadcast outcome unrecorded"
++        )
++
++
++@pytest.fixture
++def journal(tmp_path):
++    j = OperationJournal(tmp_path / "ops.sqlite")
++    yield j
++    j.close()
++
++
++class TestBuildEnvelope:
++    def test_drops_gas_nonce_and_fee_fields(self):
++        env = build_envelope(
++            {**TX, "gas": 1, "nonce": 7, "maxFeePerGas": 2, "gasPrice": 3}
++        )
++        assert env == {
++            "chainId": 8453,
++            "from": SENDER,
++            "to": TARGET,
++            "data": "0x1234",
++            "value": 0,
++        }
++
++    def test_requires_chain_and_from(self):
++        with pytest.raises(ValueError):
++            build_envelope({"to": TARGET})
++
++
++class TestLookupResult:
++    def test_landed_requires_and_normalizes_a_hash(self):
++        assert LookupResult.landed("abc").txn_hash == "0xabc"
++        with pytest.raises(ValueError):
++            LookupResult(LookupOutcome.LANDED)
++
++    def test_no_hash_may_be_attached_to_the_other_two(self):
++        assert LookupResult.never_seen().txn_hash is None
++        assert LookupResult.indeterminate("store unreachable").txn_hash is None
++        with pytest.raises(ValueError):
++            LookupResult(LookupOutcome.NEVER_SEEN, "0xabc")
++        with pytest.raises(ValueError):
++            LookupResult(LookupOutcome.INDETERMINATE, "0xabc")
++
++
++@pytest.mark.asyncio
++class TestSendTransactionViaExecutor:
++    async def test_executor_runs_before_sponsored_and_local_paths(self, journal):
++        executor = RecordingExecutor(journal)
++        cb = get_external_executor_callback(ExternalExecution(executor, journal))
++        assert cb.wallet_address == SENDER
++
++        with (
++            patch("wayfinder_paths.core.utils.transaction.gas_limit_transaction") as gl,
++            patch("wayfinder_paths.core.utils.transaction.nonce_transaction") as nonce,
++            patch("wayfinder_paths.core.utils.transaction.gas_price_transaction") as gp,
++            patch("wayfinder_paths.core.utils.transaction.broadcast_transaction") as bc,
++            patch(
++                "wayfinder_paths.core.utils.transaction.send_sponsored_transaction"
++            ) as sponsored,
++            patch("wayfinder_paths.core.utils.transaction.sponsorship_enabled") as se,
++            patch(
++                "wayfinder_paths.core.utils.transaction.wait_for_transaction_receipt"
++            ) as wait,
++        ):
++            wait.return_value = {"status": 1, "blockNumber": 10}
++            txn_hash = await send_transaction(TX, cb, wait_for_receipt=True)
++
++        assert txn_hash == f"0x{1:064x}"
++        # journal row existed (pending) at the moment the executor was invoked
++        assert executor.pending_at_submit == [journal.entries()[0]["operation_id"]]
++        for m in (gl, nonce, gp, bc, sponsored, se):
++            m.assert_not_called()
++        wait.assert_awaited_once()
++        assert wait.await_args.args[:2] == (8453, txn_hash)
++        (entry,) = journal.entries()
++        assert entry["state"] == "submitted" and entry["consumed"] is True
++        assert entry["envelope"] == build_envelope(TX)
++
++    async def test_lost_response_is_unknown_not_fallback(self, journal):
++        executor = RecordingExecutor(journal)
++        executor.lose_response = True
++        cb = get_external_executor_callback(ExternalExecution(executor, journal))
++
++        with (
++            patch("wayfinder_paths.core.utils.transaction.broadcast_transaction") as bc,
++            patch(
++                "wayfinder_paths.core.utils.transaction.send_sponsored_transaction"
++            ) as sponsored,
++            patch(
++                "wayfinder_paths.core.utils.transaction.wait_for_transaction_receipt"
++            ) as wait,
++        ):
++            with pytest.raises(ExecutionOutcomeUnknownError) as excinfo:
++                await send_transaction(TX, cb)
++
++        bc.assert_not_called()
++        sponsored.assert_not_called()
++        wait.assert_not_called()
++        (entry,) = journal.entries()
++        assert entry["state"] == "pending"
++        assert excinfo.value.operation_id == entry["operation_id"]
++
++    async def test_lookup_landed_adopts_the_transaction_without_resending(
++        self, journal
++    ):
++        executor = RecordingExecutor(journal)
++        executor.lose_response = True
++        first = ExternalExecution(executor, journal)
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            await first.send(TX)
++        assert executor.submits == 1
++
++        # "Restart": a fresh binding over the same durable journal + executor.
++        executor.lose_response = False
++        second = ExternalExecution(executor, journal)
++        txn_hash = await second.send(TX)  # identical envelope -> claimed
++        assert txn_hash == f"0x{1:064x}"
++        assert executor.submits == 1  # no resend
++        (entry,) = journal.entries()
++        assert entry["state"] == "submitted" and entry["consumed"] is True
++
++        # A different envelope after recovery is a brand-new operation.
++        other = await second.send({**TX, "data": "0x5678"})
++        assert other == f"0x{2:064x}"
++        assert executor.submits == 2
++        assert len(journal.entries()) == 2
++
++    async def test_orphan_is_not_claimable_after_a_newer_operation(self, journal):
++        # Crash on step B of [A, B]; the driver then re-runs from the top. B's
++        # landed send must not be handed to the *second* B, or the second run's
++        # B would silently be skipped.
++        executor = RecordingExecutor(journal)
++        tx_a, tx_b = TX, {**TX, "data": "0xbbbb"}
++        executor.lose_response = True
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            await ExternalExecution(executor, journal).send(tx_b)
++        executor.lose_response = False
++
++        resumed = ExternalExecution(executor, journal)
++        await resumed.send(tx_a)  # newer op: orphan is no longer latest
++        second_b = await resumed.send(tx_b)
++        assert second_b == f"0x{3:064x}"
++        assert executor.submits == 3
++        by_state = sorted(e["state"] for e in journal.entries())
++        assert by_state == ["orphaned", "submitted", "submitted"]
++        orphan = next(e for e in journal.entries() if e["state"] == "orphaned")
++        assert orphan["txn_hash"] == f"0x{1:064x}" and orphan["consumed"] is False
++
++    async def test_lookup_never_seen_lets_the_caller_send_again(self, journal):
++        # The SDK committed the journal row and died before the executor was
++        # ever reached: the executor has no record, so nothing was signed.
++        executor = RecordingExecutor(journal)
++        lost_id = journal.begin(build_envelope(TX))
++        assert (await executor.lookup(lost_id)).outcome is LookupOutcome.NEVER_SEEN
++
++        txn_hash = await ExternalExecution(executor, journal).send(TX)
++        assert txn_hash == f"0x{1:064x}"
++        states = {e["operation_id"]: e["state"] for e in journal.entries()}
++        assert states[lost_id] == "never_seen"
++        assert executor.submits == 1
++
++    async def test_lookup_indeterminate_blocks_new_sends(self, journal):
++        # The executor broadcast and died before recording the hash. A
++        # two-valued lookup would say "no hash -> never seen" and the SDK
++        # would send a second time. Three-valued: nothing is sent at all.
++        executor = RecordingExecutor(journal)
++        executor.record_hash_after_broadcast = False
++        executor.lose_response = True
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            await ExternalExecution(executor, journal).send(TX)
++        assert executor.submits == 1
++        (entry,) = journal.entries()
++        assert entry["state"] == "pending"
++
++        executor.lose_response = False
++        with pytest.raises(ExecutionOutcomeUnknownError) as excinfo:
++            await ExternalExecution(executor, journal).send(TX)  # restart
++        assert "indeterminate" in str(excinfo.value)
++        assert excinfo.value.operation_id == entry["operation_id"]
++        assert executor.submits == 1  # no second send
++        (entry,) = journal.entries()
++        assert entry["state"] == "pending"  # still pending: not a resting state
++
++    async def test_indeterminate_clears_once_the_executor_reconciles(self, journal):
++        # Same crash, then the executor reconciles against the chain and can
++        # answer landed. Only now does the SDK adopt the transaction.
++        executor = RecordingExecutor(journal)
++        executor.record_hash_after_broadcast = False
++        executor.lose_response = True
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            await ExternalExecution(executor, journal).send(TX)
++        executor.lose_response = False
++        (op_id,) = [e["operation_id"] for e in journal.entries()]
++
++        executor.records[op_id] = {"status": "broadcast", "hash": f"0x{1:064x}"}
++        txn_hash = await ExternalExecution(executor, journal).send(TX)
++        assert txn_hash == f"0x{1:064x}"
++        assert executor.submits == 1  # adopted, never resent
++        (entry,) = journal.entries()
++        assert entry["state"] == "submitted" and entry["consumed"] is True
++
++    async def test_two_valued_lookup_is_rejected_not_guessed(self, journal):
++        class LegacyLookup(RecordingExecutor):
++            async def lookup(self, operation_id):
++                record = self.records.get(operation_id) or {}
++                return record.get("hash")  # the old `str | None` contract
++
++        executor = LegacyLookup(journal)
++        journal.begin(build_envelope(TX))
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            await ExternalExecution(executor, journal).send(TX)
++        assert executor.submits == 0
++        assert journal.entries()[0]["state"] == "pending"
++
++    async def test_lookup_failure_blocks_new_sends(self, journal):
++        class BrokenLookup(RecordingExecutor):
++            async def lookup(self, operation_id):
++                raise ConnectionError("executor unreachable")
++
++        executor = BrokenLookup(journal)
++        journal.begin(build_envelope(TX))
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            await ExternalExecution(executor, journal).send(TX)
++        assert executor.submits == 0
++
++    async def test_from_must_match_executor_address(self, journal):
++        execution = ExternalExecution(RecordingExecutor(journal), journal)
++        with pytest.raises(ValueError, match="does not match executor"):
++            await execution.send({**TX, "from": TARGET})
++        assert journal.entries() == []
++
++    async def test_callback_refuses_to_sign_locally(self, journal):
++        cb = get_external_executor_callback(
++            ExternalExecution(RecordingExecutor(journal), journal)
++        )
++        with pytest.raises(RuntimeError, match="executed externally"):
++            await cb(TX)
+diff --git a/wayfinder_paths/core/utils/transaction.py b/wayfinder_paths/core/utils/transaction.py
+index 1bd9a95..c7ac417 100644
+--- a/wayfinder_paths/core/utils/transaction.py
++++ b/wayfinder_paths/core/utils/transaction.py
+@@ -20,6 +20,7 @@ from wayfinder_paths.core.constants.chains import (
+     MIN_PRIORITY_FEE_BY_CHAIN_ID,
+     PRE_EIP_1559_CHAIN_IDS,
+ )
++from wayfinder_paths.core.utils.executor import ExternalExecution
+ from wayfinder_paths.core.utils.signing_errors import (
+     SESSION_EXPIRED_MESSAGE,
+     SessionExpiredError,
+@@ -389,13 +390,25 @@ async def send_transaction(
+         confirmations = (
+             0 if _is_gorlami_fork_chain(chain_id) else _DEFAULT_CONFIRMATIONS
+         )
++    # External executor (sign_callback.external_execution): the
++    # caller-injected service owns the key, the nonce and the broadcast. It is
++    # consulted first and exclusively — an unknown outcome raises
++    # ExecutionOutcomeUnknownError and never falls through to the sponsored
++    # or local paths below, which would be a second send of the same
++    # operation. See core/utils/executor.py for the journal/idempotency rules.
++    #
+     # Remote wallets on gas-sponsored chains: the backend signs, broadcasts,
+     # and covers gas — nonce/gas/fee resolution and the raw broadcast are its
+     # job, not ours. Fork chains keep the local path so simulations never
+     # leave the fork. Every sign callback carries `wallet_address` (None for
+     # local keys) — see the factories in core/utils/wallets.py.
+     txn_hash = None
+-    if (
++    execution: ExternalExecution | None = getattr(
++        sign_callback, "external_execution", None
++    )
++    if execution is not None:
++        txn_hash = await execution.send(transaction)
++    elif (
+         sign_callback.wallet_address
+         and chain_id in GAS_SPONSORED_CHAIN_IDS
+         and not _is_gorlami_fork_chain(chain_id)
+diff --git a/wayfinder_paths/core/utils/wallets.py b/wayfinder_paths/core/utils/wallets.py
+index 8a3d5b4..eac6073 100644
+--- a/wayfinder_paths/core/utils/wallets.py
++++ b/wayfinder_paths/core/utils/wallets.py
+@@ -20,6 +20,7 @@ from wayfinder_paths.core.config import (
+     write_wallet_mnemonic,
+ )
+ from wayfinder_paths.core.constants.chains import SVM_CHAIN_IDS
++from wayfinder_paths.core.utils.executor import ExternalExecution
+ from wayfinder_paths.core.utils.signing_errors import (
+     SESSION_EXPIRED_MESSAGE,
+     SessionExpiredError,
+@@ -311,6 +312,34 @@ def get_remote_sign_hash_callback(wallet_address: str):
+     return sign_hash
+ 
+ 
++# ---------------------------------------------------------------------------
++# Signing callbacks (external executor — no key in this process)
++# ---------------------------------------------------------------------------
++
++
++def get_external_executor_callback(execution: ExternalExecution):
++    """Sign-callback for a wallet whose key lives in an external executor.
++
++    The callback satisfies the sign-callback contract (``wallet_address``,
++    ``chain_type``) so adapters and strategies can be constructed with the
++    executor's address alone. ``send_transaction`` routes every envelope
++    through ``callback.external_execution`` before the
++    sponsored and local paths; the callable itself is never awaited on that
++    path and raises if anything tries to sign locally.
++    """
++
++    async def sign_callback(transaction: dict) -> bytes:
++        raise RuntimeError(
++            "This wallet is executed externally; send_transaction must route "
++            "through sign_callback.external_execution instead of signing locally."
++        )
++
++    sign_callback.wallet_address = execution.wallet_address
++    sign_callback.chain_type = CHAIN_TYPE_ETHEREUM
++    sign_callback.external_execution = execution
++    return sign_callback
++
++
+ # ---------------------------------------------------------------------------
+ # Wallet resolution → signing callback (unified local/remote)
+ # ---------------------------------------------------------------------------

@@ -1,0 +1,15 @@
+{
+  "wayfinder": {
+    "base": "46dbf7c05e7f17e6c10a136da0dae6e13e590e95",
+    "files": {
+      "wayfinder_paths/adapters/aave_v3_adapter/adapter.py": "1199e89f0b36ed36fcc8bd4be49b16791eaf13c1db929dc3e30a74ea30cee949",
+      "wayfinder_paths/adapters/aave_v3_adapter/test_adapter.py": "7b60ffa1b604d594e211390820c1280f5a222ca81f5d0a9f6244567072ac1ec4",
+      "wayfinder_paths/core/constants/aave_v3_contracts.py": "fabc9cc483bbd3475d1139fcc24db841726c6a0e98f07b4b53ac6c38e5444463",
+      "wayfinder_paths/core/utils/executor.py": "685ec8362f01ac27568a4fbccbf2d78ed50c7cba4769e54a631f78aa3ee5e1c1",
+      "wayfinder_paths/core/utils/test_executor.py": "09313b4d82e7ea74ef1d64881a2cbf6664e3454afca0d16ca31328d04ccedf72",
+      "wayfinder_paths/core/utils/tokens.py": "d105b5992a6a1ed627dafe798ee18b8aa161dd2fc67d36ce25ffcc64b0af6fef",
+      "wayfinder_paths/core/utils/transaction.py": "0368a71db93f073ffa81f358514dcbcfbe22b88fc1534a823c4b6bd6f46ea39c",
+      "wayfinder_paths/core/utils/wallets.py": "43c3ef430bc51538edf7c49a97f33847026468d888d70bf932acdfcb9f085554"
+    }
+  }
+}

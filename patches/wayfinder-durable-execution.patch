@@ -1,0 +1,364 @@
+--- a/wayfinder_paths/core/utils/executor.py
++++ b/wayfinder_paths/core/utils/executor.py
+@@ -46,6 +46,8 @@
+ import json
+ import sqlite3
+ import uuid
++from contextlib import contextmanager
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from enum import Enum
+ from pathlib import Path
+@@ -240,6 +242,32 @@
+             """
+         )
+ 
++    def bind_step(self, step_id, envelope):
++        """Atomically persist the step and its original authorization before send."""
++        self._conn.execute("CREATE TABLE IF NOT EXISTS execution_steps (step_id TEXT PRIMARY KEY, operation_id TEXT UNIQUE NOT NULL)")
++        self._conn.execute("BEGIN IMMEDIATE")
++        try:
++            found = self._conn.execute("SELECT operation_id FROM execution_steps WHERE step_id=?", (step_id,)).fetchone()
++            if found:
++                row = next((r for r in self.entries() if r["operation_id"] == found[0]), None)
++                if row is None or row["envelope"] != envelope or row["digest"] != envelope_digest(envelope):
++                    raise ValueError("step identity/envelope conflict")
++                new = False
++            else:
++                self.require_no_unfinished(envelope)
++                op = self.begin(envelope)
++                self._conn.execute("INSERT INTO execution_steps VALUES (?,?)", (step_id, op))
++                row = next(r for r in self.entries() if r["operation_id"] == op)
++                new = True
++            self._conn.execute("COMMIT")
++            return row, new
++        except BaseException:
++            self._conn.execute("ROLLBACK")
++            raise
++
++    def invalidate_validation(self) -> None:
++        """Attempt boundary hook for journals that require fresh verification."""
++
+     def close(self) -> None:
+         self._conn.close()
+ 
+@@ -293,7 +321,7 @@
+         return [{"operation_id": r[0], "envelope": json.loads(r[1])} for r in rows]
+ 
+     def claim(self, envelope: dict[str, Any]) -> tuple[str, str] | None:
+-        """Consume the latest operation if it landed unclaimed and matches ``envelope``.
++        """Read the latest unconsumed candidate without changing the journal.
+ 
+         Returns ``(operation_id, txn_hash)`` or None. Only operations resolved
+         after a crash are ever unconsumed, and only the most recent one is
+@@ -312,12 +340,34 @@
+             or row[4] != envelope_digest(envelope)
+         ):
+             return None
+-        self._conn.execute(
++        return row[0], row[1]
++
++    def consume_claim(self, envelope: dict[str, Any], operation_id: str, txn_hash: str) -> None:
++        """Accept a validated candidate only if it still has its original binding."""
++        changed = self._conn.execute(
+             "UPDATE operations SET consumed=1, updated_at=unixepoch('subsec')"
+-            " WHERE operation_id=?",
+-            (row[0],),
+-        )
+-        return row[0], row[1]
++            " WHERE operation_id=? AND consumed=0"
++            " AND state='submitted' AND txn_hash=? AND sender=? AND chain_id=?"
++            " AND digest=? AND envelope=?",
++            (operation_id, txn_hash, envelope["from"].lower(), int(envelope["chainId"]),
++             envelope_digest(envelope), json.dumps(envelope, sort_keys=True)),
++        )
++        if changed.rowcount == 0:
++            raise ExecutionOutcomeUnknownError(
++                operation_id, "claim was consumed or changed during validation; no resend"
++            )
++
++    def require_no_unfinished(self, envelope: dict[str, Any]) -> None:
++        """Refuse allocation when this envelope already has an unfinished operation."""
++        row = self._conn.execute(
++            "SELECT operation_id FROM operations WHERE sender=? AND chain_id=? AND digest=?"
++            " AND (state='pending' OR (state='submitted' AND consumed=0)) LIMIT 1",
++            (envelope["from"].lower(), int(envelope["chainId"]), envelope_digest(envelope)),
++        ).fetchone()
++        if row is not None:
++            raise ExecutionOutcomeUnknownError(
++                row[0], "unfinished operation for this envelope cannot be claimed; no new operation"
++            )
+ 
+     def entries(self) -> list[dict[str, Any]]:
+         """All rows, oldest first (diagnostics / tests)."""
+@@ -358,6 +408,59 @@
+         self.executor = executor
+         self.journal = journal
+         self.wallet_address = AsyncWeb3.to_checksum_address(executor.wallet_address)
++        self._step = ContextVar("external_execution_step", default=None)
++        if callable(getattr(executor, "bind_journal", None)):
++            executor.bind_journal(journal)
++
++    @contextmanager
++    def step(self, step_id):
++        """Scope sends to a durable driver call; concurrent tasks have separate cursors."""
++        if self._step.get() is not None:
++            raise ValueError("nested execution step")
++        token = self._step.set([step_id, 0])
++        try:
++            yield
++        finally:
++            self._step.reset(token)
++
++    async def _validate_result(self, operation_id, txn_hash):
++        self.journal.invalidate_validation()
++        validator = getattr(self.executor, "validate_result", None)
++        try:
++            if callable(validator):
++                await validator(operation_id, txn_hash)
++        except BaseException:
++            self.journal.invalidate_validation()
++            raise
++
++    async def _send_step(self, envelope, scope):
++        step_id = f"{scope[0]}/send/{scope[1]}"
++        scope[1] += 1
++        row, new = self.journal.bind_step(step_id, envelope)
++        op_id = row["operation_id"]
++        if not new:
++            if row["state"] == "pending":
++                await self.resolve_pending(envelope["chainId"])
++                row = next(r for r in self.journal.entries() if r["operation_id"] == op_id)
++            if row["state"] != "submitted" or not row["txn_hash"]:
++                raise ExecutionOutcomeUnknownError(op_id, "step has no adoptable hash; no resend")
++            await self._validate_result(op_id, row["txn_hash"])
++            if row["consumed"]:
++                # Durable step replay is a read/return, not another consumption.
++                self.journal.invalidate_validation()
++                current = next(r for r in self.journal.entries() if r["operation_id"] == op_id)
++                if current != row:
++                    raise ExecutionOutcomeUnknownError(op_id, "step changed during validation; no resend")
++                return row["txn_hash"]
++            self.journal.record_hash(op_id, row["txn_hash"], consumed=True)
++            return row["txn_hash"]
++        try:
++            txn_hash = _normalize_hash(await self.executor.submit(envelope, operation_id=op_id))
++            await self._validate_result(op_id, txn_hash)
++            self.journal.record_hash(op_id, txn_hash, consumed=True)
++            return txn_hash
++        except Exception as exc:
++            raise ExecutionOutcomeUnknownError(op_id, str(exc)) from exc
+ 
+     async def resolve_pending(self, chain_id: int) -> list[dict[str, Any]]:
+         """Ask the executor about every ``pending`` operation for our address.
+@@ -370,6 +473,7 @@
+         earlier outcome is undetermined, and the row stays ``pending`` so the
+         next attempt asks again.
+         """
++        self.journal.invalidate_validation()
+         resolved = []
+         for entry in self.journal.pending(self.wallet_address, chain_id):
+             op_id = entry["operation_id"]
+@@ -393,6 +497,7 @@
+                 )
+             if result.outcome is LookupOutcome.LANDED:
+                 assert result.txn_hash is not None  # guaranteed by LookupResult
++                await self._validate_result(op_id, result.txn_hash)
+                 self.journal.record_hash(op_id, result.txn_hash, consumed=False)
+                 logger.info(f"Pending operation {op_id} landed as {result.txn_hash}")
+             else:
+@@ -412,6 +517,7 @@
+
+     async def send(self, transaction: dict[str, Any]) -> str:
+         """Submit ``transaction`` through the executor and return its hash."""
++        self.journal.invalidate_validation()
+         envelope = build_envelope(transaction)
+         if envelope["from"] != self.wallet_address:
+             raise ValueError(
+@@ -420,16 +526,30 @@
+             )
+         chain_id = envelope["chainId"]
+ 
++        scope = self._step.get()
++        if scope is not None:
++            # Resolve other operations before allocating anything; bind_step still
++            # checks this step's original envelope even if its hash was consumed.
++            await self.resolve_pending(chain_id)
++            return await self._send_step(envelope, scope)
+         await self.resolve_pending(chain_id)
+ 
+         claimed = self.journal.claim(envelope)
+         if claimed is not None:
+             op_id, txn_hash = claimed
++            try:
++                await self._validate_result(op_id, txn_hash)
++            except Exception as exc:
++                raise ExecutionOutcomeUnknownError(
++                    op_id, f"claim validation failed for operation {op_id}: {exc}"
++                ) from exc
++            self.journal.consume_claim(envelope, op_id, txn_hash)
+             logger.info(
+                 f"Reusing landed operation {op_id} ({txn_hash}) instead of resending"
+             )
+             return txn_hash
+ 
++        self.journal.require_no_unfinished(envelope)
+         op_id = self.journal.begin(envelope)  # durable before the executor sees it
+         logger.info(f"Submitting operation {op_id} to external executor: {envelope}")
+         try:
+@@ -444,6 +564,7 @@
+                 op_id, f"executor returned no hash for operation {op_id}"
+             )
+         txn_hash = _normalize_hash(txn_hash)
++        await self._validate_result(op_id, txn_hash)
+         self.journal.record_hash(op_id, txn_hash, consumed=True)
+         return txn_hash
+ 
+--- a/wayfinder_paths/core/utils/test_executor.py
++++ b/wayfinder_paths/core/utils/test_executor.py
+@@ -298,3 +298,56 @@
+         )
+         with pytest.raises(RuntimeError, match="executed externally"):
+             await cb(TX)
++
++
++class TestDurableSteps:
++    @pytest.mark.asyncio
++    async def test_consumed_step_keeps_identity_across_reopen(self, tmp_path):
++        path = tmp_path / 'steps.sqlite'
++        journal = OperationJournal(path)
++        executor = RecordingExecutor(journal)
++        execution = ExternalExecution(executor, journal)
++        with execution.step('run/iteration-1/borrow'):
++            first = await execution.send(TX)
++        journal.close()
++        journal = OperationJournal(path)
++        executor.journal = journal
++        execution = ExternalExecution(executor, journal)
++        with execution.step('run/iteration-1/borrow'):
++            assert await execution.send(TX) == first
++        assert executor.submits == 1
++        with pytest.raises(ValueError, match='step identity/envelope conflict'):
++            with execution.step('run/iteration-1/borrow'):
++                await execution.send({**TX, 'value': 1})
++        assert executor.submits == 1
++        with execution.step('run/iteration-2/borrow'):
++            assert await execution.send(TX) != first
++        assert executor.submits == 2
++        journal.close()
++
++    @pytest.mark.asyncio
++    async def test_step_loss_resolves_original_without_resend(self, journal):
++        executor = RecordingExecutor(journal)
++        executor.lose_response = True
++        execution = ExternalExecution(executor, journal)
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            with execution.step('run/1/wrap'):
++                await execution.send(TX)
++        operation = journal.entries()[0]['operation_id']
++        with execution.step('run/1/wrap'):
++            assert await execution.send(TX) == executor.records[operation]['hash']
++        assert executor.submits == 1
++        assert journal._conn.execute('SELECT operation_id FROM execution_steps').fetchone()[0] == operation
++
++    @pytest.mark.asyncio
++    async def test_validator_refusal_prevents_hash_transition(self, journal):
++        executor = RecordingExecutor(journal)
++        async def refuse(operation_id, txn_hash):
++            raise ExecutionOutcomeUnknownError(operation_id, 'authorization mismatch')
++        executor.validate_result = refuse
++        execution = ExternalExecution(executor, journal)
++        with pytest.raises(ExecutionOutcomeUnknownError):
++            with execution.step('run/1/borrow'):
++                await execution.send(TX)
++        assert journal.entries()[0]['state'] == 'pending'
++        assert journal.entries()[0]['txn_hash'] is None
+--- a/wayfinder_paths/core/utils/tokens.py
++++ b/wayfinder_paths/core/utils/tokens.py
+@@ -301,41 +301,48 @@
+     approval_amount: int | None = None,
+     confirmations: int | None = None,
+ ) -> tuple[bool, Any]:
+-    allowance = await get_token_allowance(token_address, chain_id, owner, spender)
+-    if allowance >= amount:
+-        return True, {}
+-
+-    if (
+-        int(chain_id),
+-        to_checksum_address(token_address),
+-    ) in TOKENS_REQUIRING_APPROVAL_RESET:
+-        clear_transaction = await build_approve_transaction(
+-            from_address=owner,
+-            chain_id=chain_id,
+-            token_address=token_address,
+-            spender_address=spender,
+-            amount=0,
+-        )
+-        await send_transaction(
+-            clear_transaction, signing_callback, confirmations=confirmations
+-        )
+-
+-    approve_tx = await build_approve_transaction(
+-        from_address=owner,
+-        chain_id=chain_id,
+-        token_address=token_address,
+-        spender_address=spender,
+-        amount=approval_amount if approval_amount is not None else amount,
+-    )
+-    txn_hash = await send_transaction(
+-        approve_tx, signing_callback, confirmations=confirmations
+-    )
+-
+-    expected = approval_amount if approval_amount is not None else amount
+-    for _ in range(32):
+-        await asyncio.sleep(0.25)
+-        on_chain = await get_token_allowance(token_address, chain_id, owner, spender)
+-        if on_chain >= expected:
+-            return True, txn_hash
+-
+-    return False, txn_hash
++    execution = getattr(signing_callback, "external_execution", None)
++    durable = getattr(execution, "durable_call", None)
++
++    async def run(name, action, *, money=False, composite=False, intent=None):
++        if durable is None:
++            return await action()
++        return await durable(name, action, intent=intent or {}, money=money,
++                             composite=composite)
++
++    async def decide():
++        observed = await get_token_allowance(token_address, chain_id, owner, spender)
++        return {"observed": observed, "required": amount,
++                "approve": observed < amount,
++                "reset": (int(chain_id), to_checksum_address(token_address))
++                         in TOKENS_REQUIRING_APPROVAL_RESET,
++                "approval_amount": approval_amount if approval_amount is not None else amount}
++
++    async def execute():
++        decision = await run("allowance-decision", decide)
++        if not decision["approve"]:
++            return True, {}
++
++        async def approve(value):
++            transaction = await build_approve_transaction(
++                from_address=owner, chain_id=chain_id, token_address=token_address,
++                spender_address=spender, amount=value)
++            return await send_transaction(transaction, signing_callback,
++                                          confirmations=confirmations)
++
++        if decision["reset"]:
++            await run("approve-reset", lambda: approve(0), money=True)
++        txn_hash = await run("approve", lambda: approve(decision["approval_amount"]), money=True)
++        # This read verifies the effect AFTER obtaining this step's journal-owned
++        # hash. It must never decide whether an in-flight approval can be skipped.
++        for _ in range(32):
++            await asyncio.sleep(0.25)
++            on_chain = await get_token_allowance(token_address, chain_id, owner, spender)
++            if on_chain >= decision["approval_amount"]:
++                return True, txn_hash
++        return False, txn_hash
++
++    return await run("ensure-allowance", execute, composite=True, intent={
++        "token_address": token_address, "owner": owner, "spender": spender,
++        "amount": amount, "chain_id": chain_id, "approval_amount": approval_amount,
++        "confirmations": confirmations})

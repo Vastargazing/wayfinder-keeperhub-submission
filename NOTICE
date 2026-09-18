@@ -1,0 +1,22 @@
+Wayfinder Paths / KeeperHub integration snapshot
+Copyright 2026 Valery Borovsky
+
+The original material in this snapshot is licensed under the Apache License,
+Version 2.0. The full license text is in LICENSE.
+
+This product includes third-party material that keeps its own terms and its own
+copyright holders. Those notices are preserved verbatim:
+
+  * Wayfinder Paths SDK context and modifications carried by the patches in
+    patches/ are MIT licensed, Copyright (c) 2024 Wayfinder. See
+    third-party/Wayfinder-LICENSE.txt.
+
+  * integration/keeperhub_executor/provenance.py contains a JSON-domain port of
+    KeeperHub lib/utils/redact.ts, Copyright 2025 Vercel, Inc., licensed under
+    the Apache License, Version 2.0. See third-party/KeeperHub-NOTICE.txt and
+    third-party/Apache-2.0.txt.
+
+The Apache-2.0 grant above applies to the original material only. It does not
+grant, change or override any rights in the third-party components named here,
+in the Wayfinder Paths SDK itself, or in dependencies; those are obtained
+separately under their own licenses. See THIRD-PARTY-NOTICES.md.

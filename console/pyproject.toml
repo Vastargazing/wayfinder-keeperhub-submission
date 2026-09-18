@@ -1,0 +1,20 @@
+[project]
+name = "keeperhub-operator-console"
+version = "0.1.0"
+description = "Read-only operator screen for a Wayfinder run executed through KeeperHub"
+requires-python = ">=3.12"
+# The read path is standard library only: sqlite3 (opened mode=ro), json and
+# http.server. Nothing here may reach a network or write to a run's artifacts.
+dependencies = []
+
+[project.optional-dependencies]
+# Only the labelled fixture builder needs the SDK, and only to reuse the real
+# OperationJournal/RunPlan writers so a fixture cannot drift from the real shape.
+fixture = ["wayfinder-paths==0.11.1", "moonwell-keeperhub-demo==0.1.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["operator_console"]

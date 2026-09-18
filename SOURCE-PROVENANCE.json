@@ -620,7 +620,8 @@
     "third-party/KeeperHub-NOTICE.txt",
     "third-party/Apache-2.0.txt",
     "LICENSE",
-    "NOTICE"
+    "NOTICE",
+    "assets/keeperhub.svg"
   ],
   "upstream_recipe": "patches/reconstruction.json",
   "ancestry": {
@@ -629,7 +630,7 @@
     "candidate_members": 135,
     "acceptance": "research/judge-source-c1-acceptance-20260915T160002Z/REVIEW.md (private working tree, not distributed here)",
     "base_revision_note": "base_revision and every baseline_sha256 are historical facts about the private working tree at that revision; they are not a claim that this repository is a byte-identical copy of that 173-file tree",
-    "relationship": "this repository ships 137 files: the 135 accepted candidate04 members, of which README.md and THIRD-PARTY-NOTICES.md were updated for the license decision, plus LICENSE and NOTICE; SNAPSHOT-MANIFEST.json is recomputed over the other 136",
+    "relationship": "this repository ships 138 files: the 135 accepted candidate04 members, of which README.md and THIRD-PARTY-NOTICES.md were updated for the license decision, plus LICENSE, NOTICE and the project logo assets/keeperhub.svg; SNAPSHOT-MANIFEST.json is recomputed over the other 137",
     "history": "new root commit; no parent, remote, alternates or objects from the private project repository"
   }
 }

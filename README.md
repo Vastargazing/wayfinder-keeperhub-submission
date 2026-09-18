@@ -1,3 +1,5 @@
+<img src="assets/keeperhub.svg" alt="Wayfinder Paths — KeeperHub" width="640">
+
 # Wayfinder Paths / KeeperHub source snapshot
 
 This repository contains a strategy built on the real Wayfinder Paths SDK, with KeeperHub used as the external transaction executor.

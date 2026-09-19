@@ -41,13 +41,28 @@ Nothing in this repository changes or grants additional rights to that third-par
 
 ## Verifying the file inventory
 
-`integration/scripts/verify_snapshot.py` checks the distributed files against [SNAPSHOT-MANIFEST.json](SNAPSHOT-MANIFEST.json).
+`python3 integration/scripts/verify_snapshot.py` checks every distributed file
+against [SNAPSHOT-MANIFEST.json](SNAPSHOT-MANIFEST.json) and reports anything
+else in the tree as an unlisted file. Run it directly in a Git clone:
 
-The script compares the entire target directory with the manifest. Because of that, running it directly against a Git clone will also see `.git` files as unlisted extras and exit non-zero.
+```
+python3 integration/scripts/verify_snapshot.py
+```
 
-To verify only the files included in the published snapshot, first export the repository tree:
+Exit 0 means every listed file is present with its recorded hash and nothing
+else is there. The only path it skips is the clone's own root `.git` directory,
+recognised by name and type without reading it: checkout metadata, not
+distributed content. Hidden files, symlinks, `.git` directories anywhere else,
+a root `.git` symlink and a root `.git` file (worktree or submodule layout, not
+supported) are all refused. After installation the tree also holds generated
+files; see [inventory checks](docs/reproduction.md#snapshot-inventory-checks)
+for `--prepared-sdk`.
 
-```bash
-git archive --format=tar HEAD | (mkdir -p ../snapshot && tar -x -C ../snapshot)
-python3 ../snapshot/integration/scripts/verify_snapshot.py
+Checking an export instead of the clone is optional. Extract into a new, empty
+directory each time rather than into an existing one:
+
+```
+SNAPSHOT_EXPORT="$(mktemp -d ../snapshot.XXXXXX)"
+git archive --format=tar HEAD | tar -x -C "$SNAPSHOT_EXPORT"
+python3 "$SNAPSHOT_EXPORT/integration/scripts/verify_snapshot.py"
 ```

@@ -1,8 +1,9 @@
 # Reproduce this snapshot
 
-Python 3.12, Git and uv are prerequisites. Work from the extracted archive root.
-Use a separate writable directory (`WORK`) for venv, cache, temporary state
-and results. Reconstruct the SDK physically inside this extracted tree at
+Python 3.12, Git and uv are prerequisites. Work from the root of a Git clone of
+this repository or of an extracted archive; either one is `SNAPSHOT` below.
+Use a separate writable directory (`WORK`) outside it for venv, cache, temporary
+state and results. Reconstruct the SDK physically inside this tree at
 `wayfinder/upstream`: existing test origin assertions require this layout.
 The generated SDK is not part of the source archive; keep the sealed export and
 archive untouched. This task used a new
@@ -14,9 +15,29 @@ That does not prove a new network installation or installation of Python/uv.
 Obtain the SDK Git object at `46dbf7c05e7f17e6c10a136da0dae6e13e590e95` separately
 from https://github.com/WayfinderFoundation/wayfinder-paths-sdk . `SDK_OBJECTS`
 is a local repository containing that exact object. Preparation does not fetch.
-`WORK` must be outside this source tree. `SNAPSHOT` is the absolute extracted
-root. Set `SDK="$SNAPSHOT/wayfinder/upstream"`; this must be a physical directory,
-not a symlink to an external SDK. Paths below are user-selected absolute paths.
+`WORK` must be outside this source tree. `SNAPSHOT` is the absolute root of the
+clone or extraction. Set `SDK="$SNAPSHOT/wayfinder/upstream"`; this must be a
+physical directory, not a symlink to an external SDK. Paths below are
+user-selected absolute paths. Before installing anything, run the
+[inventory check](#snapshot-inventory-checks) once from `SNAPSHOT`.
+
+What must exist before the commands, and what they create:
+
+- `SDK_OBJECTS`: an existing local Git repository that already contains commit
+  `46dbf7c05e7f17e6c10a136da0dae6e13e590e95`. `prepare_sdk_snapshot.py` reads
+  it with `git archive` and never fetches.
+- `$WORK/cache`: a uv cache that already holds every wheel named in
+  `requirements.lock`. `--offline` installs from this cache only; a missing
+  entry is a failure, not a download. Using a locally available cache is not
+  a network installation and does not demonstrate one.
+- `$SDK`, `$WORK/recipe` and `$WORK/user-path` must not exist yet; the scripts
+  create them and refuse an existing directory. `uv venv` creates `$WORK/venv`;
+  `judge_checks.py` creates `$WORK/results`. Create `$WORK/tmp` yourself before
+  the check commands.
+- Inside `SNAPSHOT` the commands create only the generated `wayfinder/upstream`
+  and the `*.egg-info` metadata of the editable installs; both are accounted for
+  by `verify_snapshot.py --prepared-sdk`. In a Git clone they appear as untracked
+  or ignored paths; the tracked files stay unchanged.
 
 ```sh
 python3 integration/scripts/prepare_sdk_snapshot.py --objects "$SDK_OBJECTS" --dest "$SDK" --out "$WORK/recipe"
@@ -26,11 +47,42 @@ UV_CACHE_DIR="$WORK/cache" uv pip install --offline --no-deps --python "$WORK/ve
 uv pip check --python "$WORK/venv/bin/python"
 ```
 
+The preparation applies the three pinned patches to `$SDK` itself, in a Git clone
+exactly as in an extraction. The patch commands are confined to that directory:
+a repository around the snapshot is neither consulted nor changed, no repository
+is created inside `$SDK`, and no `GIT_CEILING_DIRECTORIES`, `GIT_DIR` or other
+Git variable has to be set — one already in the environment is ignored for those
+commands only. If the destination still resolves into a repository, the script
+stops with a nonzero exit naming that directory instead of writing a partly
+patched SDK. `check_sdk_snapshot.py` reconstructs its own copy the same way,
+including when `TMPDIR` is inside a clone. The recipe output records the
+discovery check next to each patch log.
+
 For a 1 GiB memory limit, install each noncomment line of `requirements.lock`
 sequentially with `--offline --no-deps`, then install the five editable packages
 separately and run `uv pip check`. Missing cache entries are blockers. Check the
 editable maps and actual imports: the four project modules must resolve into
 this extracted tree and `wayfinder_paths` into the reconstructed SDK.
+
+## Snapshot inventory checks
+
+Before installation, from `SNAPSHOT`, the tree must contain only the listed files:
+
+```sh
+python3 integration/scripts/verify_snapshot.py
+```
+
+This runs in a Git clone as well as in an extraction. The clone's own root
+`.git` directory is the only path skipped, by name and type and without reading
+it; any other unlisted path, hidden file, symlink or nested `.git` is refused
+with exit 1 and named in the JSON `errors`. A root `.git` that is a symlink or a
+file (worktree layout) is refused as unsupported. After
+[Prepare and install](#prepare-and-install) the tree additionally holds
+`wayfinder/upstream` and `*.egg-info` directories; from then on run
+`verify_snapshot.py --prepared-sdk`, which accounts for exactly those two kinds
+of generated paths and also checks the eight recipe targets of the generated
+SDK. Keep `PYTHONDONTWRITEBYTECODE=1` set as below, otherwise `__pycache__`
+directories appear as unlisted files.
 
 ## Snapshot check commands
 

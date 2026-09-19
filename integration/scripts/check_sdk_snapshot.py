@@ -15,6 +15,49 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[2]
 SDK_BASE = '46dbf7c05e7f17e6c10a136da0dae6e13e590e95'
 SDK_PATCHES = ['wayfinder-external-executor-seam.patch','wayfinder-base-sepolia.patch','wayfinder-durable-execution.patch']
+# Variables that bypass repository discovery or redirect object lookup; they are dropped for the SDK Git commands only.
+EXPLICIT_GIT_ENV = ('GIT_DIR','GIT_WORK_TREE','GIT_INDEX_FILE','GIT_OBJECT_DIRECTORY','GIT_COMMON_DIR',
+                    'GIT_ALTERNATE_OBJECT_DIRECTORIES','GIT_CEILING_DIRECTORIES','GIT_DISCOVERY_ACROSS_FILESYSTEM')
+
+
+def sdk_git_env(tree=None, env=None):
+    """Environment for the Git commands that build the SDK copy.
+
+    `git apply` resolves a git-style diff against the top level of whatever repository it discovers from the
+    current directory, and silently ignores hunks whose paths fall outside that directory. The documented layout
+    puts the SDK copy inside the snapshot, so in a Git clone that discovery reaches the clone, the two git-style
+    patches are read as repository-root-relative and apply nothing.
+
+    The upward search is therefore stopped directly above `tree`: a ceiling entry must be a proper ancestor of the
+    starting directory and is itself never entered, so naming the parent leaves exactly `tree` to be examined, and
+    it has no repository of its own. The variables that would bypass discovery altogether or redirect object
+    lookup are removed as well - for these commands only. The caller's own environment, the user's Git
+    configuration and the surrounding repository are untouched, no repository is created inside the SDK copy, and
+    this is not a general safety wrapper for other Git commands. A path containing ':' cannot be expressed in
+    GIT_CEILING_DIRECTORIES, and a `tree` directly at the filesystem root has no parent to name; the discovery
+    check in `apply_recipe` turns both into a refusal instead of a silently wrong reconstruction.
+    """
+    out={k:v for k,v in (os.environ if env is None else env).items() if k not in EXPLICIT_GIT_ENV}
+    if tree is not None: out['GIT_CEILING_DIRECTORIES']=str(Path(tree).resolve().parent)
+    return out
+
+
+def apply_recipe(tree, out, patches=SDK_PATCHES):
+    """Apply the pinned patches in order to `tree`, treated as a plain directory of files, and record every command.
+
+    Both consumers - `prepare_sdk_snapshot.py` and this script's own reconstruction - go through here, so both
+    rebuild the same pinned SDK from local objects and exactly these patches. No fetch, no download, no fallback
+    to another SDK revision."""
+    tree=Path(tree).resolve()
+    env=sdk_git_env(tree)
+    rows=[run(['git','rev-parse','--show-toplevel'],tree,out,'git-discovery',env,expect=None)]
+    if rows[0]['exit']==0:
+        raise ValueError(f'{tree} still resolves into a Git repository for these commands; the recipe would be '
+                         f'applied against its root instead of this directory, see {out/"git-discovery.log"}')
+    for name in patches:
+        rows.append(run(['git','apply','--check',str(ROOT/'patches'/name)],tree,out,name+'-check',env))
+        rows.append(run(['git','apply',str(ROOT/'patches'/name)],tree,out,name+'-apply',env))
+    return rows
 
 
 def verify_reconstruction(tree, manifest, source, patches, output):
@@ -37,15 +80,16 @@ def verify_reconstruction(tree, manifest, source, patches, output):
 def extract(repo, pin, dest):
     dest.mkdir(parents=True)
     with tempfile.TemporaryFile() as stream:
-        subprocess.run(['git','-C',str(repo),'archive',pin],stdout=stream,check=True)
+        subprocess.run(['git','-C',str(repo),'archive',pin],stdout=stream,check=True,env=sdk_git_env())
         stream.seek(0)
         with tarfile.open(fileobj=stream) as archive: archive.extractall(dest,filter='data')
 
 
 def run(cmd, cwd, out, name, env=None, expect=0):
+    """`expect=None` records the command's own exit instead of requiring one; the caller then decides."""
     p=subprocess.run(cmd,cwd=cwd,env=env,text=True,capture_output=True)
     (out/(name+'.log')).write_text(p.stdout+p.stderr)
-    assert p.returncode==expect,(name,p.returncode,p.stdout[-1000:],p.stderr[-1000:])
+    assert expect is None or p.returncode==expect,(name,p.returncode,p.stdout[-1000:],p.stderr[-1000:])
     return dict(name=name,command=cmd,exit=p.returncode,log=name+'.log')
 
 
@@ -63,9 +107,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='upstream-check-') as td:
         temp=Path(td);sdk=temp/'sdk'
         extract(args.objects,SDK_BASE,sdk)
-        for name in SDK_PATCHES:
-            results.append(run(['git','apply','--check',str(ROOT/'patches'/name)],sdk,args.out,name+'-check'))
-            results.append(run(['git','apply',str(ROOT/'patches'/name)],sdk,args.out,name+'-apply'))
+        results.extend(apply_recipe(sdk,args.out))
         verify_reconstruction(sdk,manifest,'wayfinder',SDK_PATCHES,args.out/'sdk-reconstruction.json')
         env={**os.environ,'PYTHONPATH':os.pathsep.join(map(str,[sdk,ROOT/'integration',ROOT/'hosted-sepolia']))}
         results.append(run([sys.executable,'-c',

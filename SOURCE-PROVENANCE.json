@@ -9,7 +9,7 @@
     },
     "README.md": {
       "baseline_sha256": "66954664b3ed59d0d5c6ddee16afa50ebe582d114e8e2ddce9b23148f1aadb20",
-      "snapshot_sha256": "3349a37d6dc49f224115426300871d32e950658440332ea51d0555fc797f6584",
+      "snapshot_sha256": "824ea12a352950c1183b1d6195341cac51c99a3ae7190f006046406a0250639a",
       "mapping": "adjust"
     },
     "console/README.md": {
@@ -164,7 +164,7 @@
     },
     "docs/reproduction.md": {
       "baseline_sha256": "66aeb789d1952d4d424717922040257193b3a1e71a9f8b37ba29eaab343df1db",
-      "snapshot_sha256": "6eddbd75f17931786a993d0b24a5fc5c25d8736d4c6b77d0c44a9909addacb48",
+      "snapshot_sha256": "ee61aefe259c585171db6ee89405207ce1f8dcfe97ac5608a24ada928f818502",
       "mapping": "adjust"
     },
     "docs/submission-evidence.md": {
@@ -621,7 +621,9 @@
     "third-party/Apache-2.0.txt",
     "LICENSE",
     "NOTICE",
-    "assets/keeperhub.svg"
+    "assets/keeperhub.svg",
+    "integration/tests/test_sdk_preparation.py",
+    "integration/tests/test_snapshot_inventory.py"
   ],
   "upstream_recipe": "patches/reconstruction.json",
   "ancestry": {
@@ -630,7 +632,185 @@
     "candidate_members": 135,
     "acceptance": "research/judge-source-c1-acceptance-20260915T160002Z/REVIEW.md (private working tree, not distributed here)",
     "base_revision_note": "base_revision and every baseline_sha256 are historical facts about the private working tree at that revision; they are not a claim that this repository is a byte-identical copy of that 173-file tree",
-    "relationship": "this repository ships 138 files: the 135 accepted candidate04 members, of which README.md and THIRD-PARTY-NOTICES.md were updated for the license decision, plus LICENSE, NOTICE and the project logo assets/keeperhub.svg; SNAPSHOT-MANIFEST.json is recomputed over the other 137",
-    "history": "new root commit; no parent, remote, alternates or objects from the private project repository"
+    "relationship": "this repository ships 140 files: the 135 accepted candidate04 members, of which README.md and THIRD-PARTY-NOTICES.md were updated for the license decision, plus LICENSE, NOTICE, the project logo assets/keeperhub.svg and the two reproducibility tests integration/tests/test_sdk_preparation.py and integration/tests/test_snapshot_inventory.py; SNAPSHOT-MANIFEST.json is recomputed over the other 139",
+    "history": "new root commit; no parent, remote, alternates or objects from the private project repository",
+    "post_submission": {
+      "base_commit": "d15142ea250a5f79ad325b86f514cd5f2dcbfbb3",
+      "base_commit_files": 137,
+      "note": "follow-up after the published root commit: this block describes the delta from that commit; base_revision and every baseline_sha256 above remain historical facts about the private working tree and are unchanged This block is historical: it describes the delta from d15142ea, the revision that preceded the owner's logo and README commits, and its files_now and unchanged_files count that superseded maintenance tree, not this delivery. What this delivery ships is described in ancestry.reconciliation.",
+      "steps": [
+        {
+          "step": "POST-1",
+          "accepted": "research/snapshot-verifier-acceptance-20260918T065719Z/REVIEW.md",
+          "reason": "integration/scripts/verify_snapshot.py treated a normal Git clone's own root .git directory as unlisted files and exited 1 in a clone (182 errors in the published revision) although all 136 listed hashes matched; it now skips exactly that directory by name and type without reading it, refuses a root .git symlink or file, and still refuses every other unlisted path",
+          "changed_files": {
+            "README.md": {
+              "before": "24354d4809abe445707b2eccc3afabd40e97a540e2e4d6916d424a4c487e60ef",
+              "after": "1eef9b9004d936ceec7d69919d7928335e020804218c8da0d2b3877580470021"
+            },
+            "docs/reproduction.md": {
+              "before": "6eddbd75f17931786a993d0b24a5fc5c25d8736d4c6b77d0c44a9909addacb48",
+              "after": "5fb0e88d958b714cf44ac4126768d2f38fa2b33759aecbea5844d560f7cd1960"
+            },
+            "integration/scripts/verify_snapshot.py": {
+              "before": "d04561a333a6366eb8aeb983d17e8130291bea395c6d8bf081a03e7be076d778",
+              "after": "bb8ee4dc322a9bae021a0db691e07d9bea96dff0b93454c313662b073010d77d"
+            }
+          },
+          "added_files": [
+            "integration/tests/test_snapshot_inventory.py"
+          ],
+          "files_after": 138
+        },
+        {
+          "step": "POST-2",
+          "reason": "prepare_sdk_snapshot.py ran `git apply` from the SDK destination, which the documented layout puts inside the snapshot; in a Git clone Git discovered that repository, read the two git-style patches as paths relative to its root and applied none of their hunks, after which the third, plain patch failed on the files the first should have created (exit 1, six of eight recipe targets). Both consumers now apply the recipe through one helper that stops repository discovery directly above the destination and drops the variables that would bypass it, for those commands only; a destination that still resolves into a repository is refused instead of silently reconstructed against the wrong root.",
+          "changed_files": {
+            "README.md": {
+              "before": "1eef9b9004d936ceec7d69919d7928335e020804218c8da0d2b3877580470021",
+              "after": "ca898ff80ff3872ef56167b96079496fc1f3256fc29fef99caaadd5dc1e36730"
+            },
+            "docs/reproduction.md": {
+              "before": "5fb0e88d958b714cf44ac4126768d2f38fa2b33759aecbea5844d560f7cd1960",
+              "after": "ee61aefe259c585171db6ee89405207ce1f8dcfe97ac5608a24ada928f818502"
+            },
+            "integration/scripts/check_sdk_snapshot.py": {
+              "before": "1cbd0a31b83a4437bfebeda5466134284c612825f9f4a40ac3e0fdf00fb1a54d",
+              "after": "91bcd0a1aeb7210e663f0563119ce4f54c15e4446d2827c7babc14abb4a4782e"
+            },
+            "integration/scripts/prepare_sdk_snapshot.py": {
+              "before": "955a33e23b4ccb698707b001026201e3fd573cc548713db30ccb02816478cc82",
+              "after": "ad61a391dcbc27b2f35484333963b21759d008cf320e3a82ebafb477de251240"
+            }
+          },
+          "added_files": [
+            "integration/tests/test_sdk_preparation.py"
+          ],
+          "files_after": 139,
+          "boundaries": "the pinned SDK commit, the three patches and patches/reconstruction.json are unchanged; no repository is created inside the SDK copy, no Git configuration is required or written, and the surrounding repository is neither staged nor modified"
+        }
+      ],
+      "changed_files": {
+        "README.md": {
+          "before": "24354d4809abe445707b2eccc3afabd40e97a540e2e4d6916d424a4c487e60ef",
+          "after": "ca898ff80ff3872ef56167b96079496fc1f3256fc29fef99caaadd5dc1e36730"
+        },
+        "docs/reproduction.md": {
+          "before": "6eddbd75f17931786a993d0b24a5fc5c25d8736d4c6b77d0c44a9909addacb48",
+          "after": "ee61aefe259c585171db6ee89405207ce1f8dcfe97ac5608a24ada928f818502"
+        },
+        "integration/scripts/check_sdk_snapshot.py": {
+          "before": "1cbd0a31b83a4437bfebeda5466134284c612825f9f4a40ac3e0fdf00fb1a54d",
+          "after": "91bcd0a1aeb7210e663f0563119ce4f54c15e4446d2827c7babc14abb4a4782e"
+        },
+        "integration/scripts/prepare_sdk_snapshot.py": {
+          "before": "955a33e23b4ccb698707b001026201e3fd573cc548713db30ccb02816478cc82",
+          "after": "ad61a391dcbc27b2f35484333963b21759d008cf320e3a82ebafb477de251240"
+        },
+        "integration/scripts/verify_snapshot.py": {
+          "before": "d04561a333a6366eb8aeb983d17e8130291bea395c6d8bf081a03e7be076d778",
+          "after": "bb8ee4dc322a9bae021a0db691e07d9bea96dff0b93454c313662b073010d77d"
+        }
+      },
+      "metadata_files": [
+        "SOURCE-PROVENANCE.json",
+        "SNAPSHOT-MANIFEST.json"
+      ],
+      "added_files": [
+        "integration/tests/test_sdk_preparation.py",
+        "integration/tests/test_snapshot_inventory.py"
+      ],
+      "files_now": 139,
+      "unchanged_files": 130
+    },
+    "reconciliation": {
+      "base_commit": "7090431b59edd1fc04f530bba349f7a83a3a4df2",
+      "base_commit_files": 138,
+      "supersedes": "ancestry.post_submission",
+      "note": "the accepted POST-1/2 reproducibility work was re-applied on top of the public base 7090431b, which carries the owner's logo and README commits on top of d15142ea. Between those two revisions the owner changed only README.md, SNAPSHOT-MANIFEST.json and SOURCE-PROVENANCE.json and added assets/keeperhub.svg, so the four code and documentation files the accepted work modifies had identical bytes in both bases and were transferred unchanged. No behaviour of the strategy, the executor, recovery, the hosted profile or the live cycle was touched, no dependency or SDK pin was moved and no claim was strengthened.",
+      "owner_commits": [
+        {
+          "commit": "7090431b59edd1fc04f530bba349f7a83a3a4df2",
+          "author": "Vastargazing <vebohr@gmail.com>",
+          "subject": "Show the logo in README and refresh its recorded hashes"
+        },
+        {
+          "commit": "17fb903a73509280fc508eb01934685c3bced06d",
+          "author": "Valery Borovsky <138976239+Vastargazing@users.noreply.github.com>",
+          "subject": "Update README for clarity and structure"
+        },
+        {
+          "commit": "f1a6c97e230a076982fd22b3ac75d780ef9c5501",
+          "author": "Vastargazing <vebohr@gmail.com>",
+          "subject": "Add the project logo and list it in the snapshot metadata"
+        }
+      ],
+      "transferred_byte_for_byte": {
+        "docs/reproduction.md": {
+          "base_7090431b": "6eddbd75f17931786a993d0b24a5fc5c25d8736d4c6b77d0c44a9909addacb48",
+          "delivered": "ee61aefe259c585171db6ee89405207ce1f8dcfe97ac5608a24ada928f818502",
+          "accepted_post12": "ee61aefe259c585171db6ee89405207ce1f8dcfe97ac5608a24ada928f818502"
+        },
+        "integration/scripts/check_sdk_snapshot.py": {
+          "base_7090431b": "1cbd0a31b83a4437bfebeda5466134284c612825f9f4a40ac3e0fdf00fb1a54d",
+          "delivered": "91bcd0a1aeb7210e663f0563119ce4f54c15e4446d2827c7babc14abb4a4782e",
+          "accepted_post12": "91bcd0a1aeb7210e663f0563119ce4f54c15e4446d2827c7babc14abb4a4782e"
+        },
+        "integration/scripts/prepare_sdk_snapshot.py": {
+          "base_7090431b": "955a33e23b4ccb698707b001026201e3fd573cc548713db30ccb02816478cc82",
+          "delivered": "ad61a391dcbc27b2f35484333963b21759d008cf320e3a82ebafb477de251240",
+          "accepted_post12": "ad61a391dcbc27b2f35484333963b21759d008cf320e3a82ebafb477de251240"
+        },
+        "integration/scripts/verify_snapshot.py": {
+          "base_7090431b": "d04561a333a6366eb8aeb983d17e8130291bea395c6d8bf081a03e7be076d778",
+          "delivered": "bb8ee4dc322a9bae021a0db691e07d9bea96dff0b93454c313662b073010d77d",
+          "accepted_post12": "bb8ee4dc322a9bae021a0db691e07d9bea96dff0b93454c313662b073010d77d"
+        },
+        "integration/tests/test_sdk_preparation.py": {
+          "base_7090431b": null,
+          "delivered": "3fd32acb5abbd19d2d12c613e56d0d859f8191e533b86f60b778960874f5be29",
+          "accepted_post12": "3fd32acb5abbd19d2d12c613e56d0d859f8191e533b86f60b778960874f5be29"
+        },
+        "integration/tests/test_snapshot_inventory.py": {
+          "base_7090431b": null,
+          "delivered": "cdbebcc70d5d812f0ddd31fc2a50efaff9af4dc389b556843aea01618a7d2068",
+          "accepted_post12": "cdbebcc70d5d812f0ddd31fc2a50efaff9af4dc389b556843aea01618a7d2068"
+        }
+      },
+      "reconciled": {
+        "README.md": {
+          "base_7090431b": "3349a37d6dc49f224115426300871d32e950658440332ea51d0555fc797f6584",
+          "delivered": "824ea12a352950c1183b1d6195341cac51c99a3ae7190f006046406a0250639a",
+          "accepted_post12": "ca898ff80ff3872ef56167b96079496fc1f3256fc29fef99caaadd5dc1e36730",
+          "how": "every byte before the \"## Verifying the file inventory\" heading is the 7090431b README, logo, introduction and licence included; that section onwards is the accepted POST-1/2 section verbatim. The accepted \"## Preparing the SDK\" section was not carried over, because it sits inside the preserved prefix; docs/reproduction.md documents that recipe."
+        },
+        "SOURCE-PROVENANCE.json": {
+          "digest_omitted": "a metadata file records no digest of itself here: SOURCE-PROVENANCE.json would be self-referential and SNAPSHOT-MANIFEST.json is computed over this file afterwards",
+          "how": "reconciled in this delivery"
+        },
+        "SNAPSHOT-MANIFEST.json": {
+          "digest_omitted": "a metadata file records no digest of itself here: SOURCE-PROVENANCE.json would be self-referential and SNAPSHOT-MANIFEST.json is computed over this file afterwards",
+          "how": "reconciled in this delivery"
+        }
+      },
+      "changed_paths": [
+        "README.md",
+        "SNAPSHOT-MANIFEST.json",
+        "SOURCE-PROVENANCE.json",
+        "docs/reproduction.md",
+        "integration/scripts/check_sdk_snapshot.py",
+        "integration/scripts/prepare_sdk_snapshot.py",
+        "integration/scripts/verify_snapshot.py",
+        "integration/tests/test_sdk_preparation.py",
+        "integration/tests/test_snapshot_inventory.py"
+      ],
+      "added_files": [
+        "integration/tests/test_sdk_preparation.py",
+        "integration/tests/test_snapshot_inventory.py"
+      ],
+      "files_now": 140,
+      "unchanged_from_base": 131,
+      "boundaries": "the logo blob and its mode come from 7090431b untouched, the owner's three commits keep their authorship and history, nothing was committed, staged, fetched or pushed by this step, and the remaining 131 files of the base are byte-identical"
+    }
   }
 }
